@@ -12,6 +12,14 @@ hkMemoryRouter &hkGetMemoryRouter()
     return *(hkMemoryRouter *)(hkUlong)TlsGetValue(*g_havokMemoryRouterTlsIndex);
 }
 
+int HK_CALL hkColor::rgbFromChars(unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha)
+{
+    return static_cast<int>((static_cast<unsigned int>(alpha) << 24) |
+                            (static_cast<unsigned int>(red) << 16) |
+                            (static_cast<unsigned int>(green) << 8) |
+                            static_cast<unsigned int>(blue));
+}
+
 hkUFloat8 &hkUFloat8::operator=(const float &fv)
 {
     hkRealTohkUFloat8(*this, fv);
@@ -441,4 +449,3 @@ int hkbBehaviorGraph_getInternalEventId(hkbBehaviorGraph *graph, int externalEve
         return (externalEventId < 0) ? externalEventId : hkPointerMap_getWithDefault((void *)&graph->eventIDMap->m_externalToInternalMap, externalEventId + 1, -1);
 	}
 }
-

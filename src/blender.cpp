@@ -125,10 +125,3 @@ bool Blender::Update(const ActiveRagdoll &ragdoll, const hkbRagdollDriver &drive
 
     return false;
 }
-
-void BlendPoses(const hkQsTransform *srcPoses, const hkQsTransform *dstPoses, hkQsTransform *outPoses, float *weights, int numPoses)
-{
-    for (int i = 0; i < numPoses; i++) {
-        outPoses[i].setInterpolate4(srcPoses[i], dstPoses[i], weights[i]);
-    }
-}

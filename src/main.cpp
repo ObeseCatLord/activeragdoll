@@ -6,6 +6,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <chrono>
+#include <new>
 
 #include <Physics/Collide/Shape/Convex/ConvexVertices/hkpConvexVerticesShape.h>
 #include <Physics/Collide/Shape/Convex/Capsule/hkpCapsuleShape.h>
@@ -3106,7 +3107,16 @@ void TryUpdateNPCState(Actor *actor, bool isShoved, bool wasJustRagdolled)
 
 hkaKeyFrameHierarchyUtility::Output g_stressOut[200]; // set in a hook during driveToPose(). Just reserve a bunch of space so it can handle any number of bones.
 
-hkArray<hkVector4> g_scratchHkArray{}; // We can't call the destructor of this ourselves, so this is a global array to be used at will and never deallocated.
+// This game-owned Havok array intentionally lives until process exit. Construct
+// it in inert storage so the CRT never registers an hkArray destructor that
+// would route through the standalone SDK's allocator singleton during DLL unload.
+alignas(hkArray<hkVector4>) unsigned char g_scratchHkArrayStorage[sizeof(hkArray<hkVector4>)]{};
+
+hkArray<hkVector4> &GetScratchHkArray()
+{
+    static hkArray<hkVector4> *const scratch = ::new (g_scratchHkArrayStorage) hkArray<hkVector4>();
+    return *scratch;
+}
 
 bool IsAddedToWorld(Actor *actor)
 {
@@ -4950,8 +4960,8 @@ void ProcessHavokHitJobsHook(HavokHitJobs *havokHitJobs)
 
                 if (Config::options.resizePlayerCharController && convexVerticesShape) {
                     // Shrink convex charcontroller shape
-                    g_scratchHkArray.clear();
-                    hkArray<hkVector4> &verts = g_scratchHkArray;
+                    hkArray<hkVector4> &verts = GetScratchHkArray();
+                    verts.clear();
 
                     hkpConvexVerticesShape_getOriginalVertices(convexVerticesShape, verts);
 

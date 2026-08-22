@@ -50,5 +50,3 @@ struct Blender
     bool isActive = false;
     bool ignoreRoot = false;
 };
-
-void BlendPoses(const hkQsTransform *srcPoses, const hkQsTransform *dstPoses, hkQsTransform *outPoses, float *weights, int numPoses);
