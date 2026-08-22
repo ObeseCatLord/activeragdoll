@@ -46,6 +46,12 @@
 #include "papyrusapi.h"
 #include "draw.h"
 
+// The runtime SDK declares this constructor in a Havok library that SKSE
+// plugins do not link. PLANCK fills every field explicitly before passing the
+// config to the relocated game constructor, so provide the layout-neutral
+// definition locally instead of depending on an unavailable import library.
+hkpConvexVerticesShape::BuildConfig::BuildConfig() = default;
+
 
 // SKSE globals
 static PluginHandle	g_pluginHandle = kPluginHandle_Invalid;
@@ -318,7 +324,7 @@ void ProcessRemotePhysics002();
 void ResetRemotePhysics002();
 namespace {
     bool ShouldSuppressLocalPhysicalEvent002(UInt32 targetFormId);
-    bool CopyLocalNodeName002(char (&destination)[PlanckPluginAPI::kPlanckInterface002NodeNameCapacity], const char *source);
+    bool CopyLocalNodeName002(char *destination, size_t destinationCapacity, const char *source);
     void TrackLocalRagdollEnter002(Actor *actor, const NiPoint3 &sourcePosition);
     void UpdateLocalActorPhysicalEvents002();
     void ResetLocalActorPhysicalEvents002();
@@ -1887,7 +1893,7 @@ struct PhysicsListener :
             localEvent.impulseMultiplier = impulseMult;
             localEvent.flags = (hitActor ? 1u : 0u) | (isLeft ? 2u : 0u) | (isOffhand ? 4u : 0u) | (isTwoHanding ? 8u : 0u) | (isStab ? 16u : 0u);
             if (NiPointer<NiAVObject> hitNode = GetNodeFromCollidable(hitRigidBody->getCollidable())) {
-                if (CopyLocalNodeName002(localEvent.nodeName, hitNode->m_name.cString())) {
+                if (CopyLocalNodeName002(localEvent.nodeName, sizeof(localEvent.nodeName), hitNode->m_name.cString())) {
                     g_interface002.EnqueueLocalPhysicalEvent(localEvent);
                 }
             }
@@ -4105,7 +4111,8 @@ void RagdollActorFromPosition(Actor *actor, const NiPoint3 &sourcePosition, bool
         if (playSound && Config::options.playRagdollSound) {
             PlayRagdollSound(actor);
         }
-        ActorProcess_PushActorAway(process, actor, sourcePosition, 0.f);
+        NiPoint3 pushSourcePosition = sourcePosition;
+        ActorProcess_PushActorAway(process, actor, pushSourcePosition, 0.f);
     }
 }
 
@@ -4191,12 +4198,15 @@ namespace {
         }
     }
 
-    bool CopyLocalNodeName002(char (&destination)[PlanckPluginAPI::kPlanckInterface002NodeNameCapacity], const char *source)
+    bool CopyLocalNodeName002(char *destination, size_t destinationCapacity, const char *source)
     {
-        if (!source) return false;
-        for (UInt32 i = 0; i + 1 < PlanckPluginAPI::kPlanckInterface002NodeNameCapacity; ++i) {
+        if (!destination || destinationCapacity != PlanckPluginAPI::kPlanckInterface002NodeNameCapacity || !source) return false;
+        for (UInt32 i = 0; i + 1 < destinationCapacity; ++i) {
             const unsigned char character = static_cast<unsigned char>(source[i]);
-            if (character == '\0') return i != 0;
+            if (character == '\0') {
+                destination[i] = '\0';
+                return i != 0;
+            }
             if (character < 0x20 || character == 0x7f) return false;
             destination[i] = static_cast<char>(character);
         }
@@ -4264,7 +4274,7 @@ namespace {
         NiPointer<NiNode> root = actor->GetNiNode();
         if (!root || !FindRigidBody(root, heldRigidBody)) return false;
         NiPointer<NiAVObject> node = GetNodeFromCollidable(heldRigidBody->hkBody->getCollidable());
-        if (!node || !CopyLocalNodeName002(event.nodeName, node->m_name.cString())) return false;
+        if (!node || !CopyLocalNodeName002(event.nodeName, sizeof(event.nodeName), node->m_name.cString())) return false;
 
         hkpRigidBody *body = heldRigidBody->hkBody;
         const NiPoint3 position = HkVectorToNiPoint(body->getCenterOfMassInWorld()) * *g_inverseHavokWorldScale;
@@ -4440,7 +4450,7 @@ namespace {
         const float sinHalfAngle = sinf(halfAngle);
         if (sinHalfAngle > 0.001f) {
             const NiPoint3 axis{ rotationError.m_fX / sinHalfAngle, rotationError.m_fY / sinHalfAngle, rotationError.m_fZ / sinHalfAngle };
-            rotationalVelocity += axis * std::min(halfAngle * 2.f * kRemoteGripPositionGain002, kRemoteGripMaxDeltaVelocity002);
+            rotationalVelocity += axis * (std::min)(halfAngle * 2.f * kRemoteGripPositionGain002, kRemoteGripMaxDeltaVelocity002);
         }
         const NiPoint3 angularDelta = ClampMagnitude002(rotationalVelocity - HkVectorToNiPoint(body->getAngularVelocity()), kRemoteGripMaxDeltaVelocity002);
         body->m_motion.applyAngularImpulse(NiPointToHkVector(ClampMagnitude002(angularDelta, kRemoteGripMaxAngularImpulse002)));
@@ -4994,9 +5004,15 @@ void ProcessHavokHitJobsHook(HavokHitJobs *havokHitJobs)
 
                     hkStridedVertices newVerts(verts);
 
-                    //hkpConvexVerticesShape::BuildConfig buildConfig{false, false, true, 0.05f, 0, 0.05f, 0.07f, -0.1f}; // defaults
-                    //hkpConvexVerticesShape::BuildConfig buildConfig{ true, false, true, 0.05f, 0, 0, 0, -0.1f }; // some havok func uses these values
-                    hkpConvexVerticesShape::BuildConfig buildConfig{ false, false, true, 0.05f, 0, 0.f, 0.f, -0.1f };
+                    hkpConvexVerticesShape::BuildConfig buildConfig;
+                    buildConfig.m_createConnectivity = false;
+                    buildConfig.m_shrinkByConvexRadius = false;
+                    buildConfig.m_useOptimizedShrinking = true;
+                    buildConfig.m_convexRadius = 0.05f;
+                    buildConfig.m_maxVertices = 0;
+                    buildConfig.m_maxRelativeShrink = 0.f;
+                    buildConfig.m_maxShrinkingVerticesDisplacement = 0.f;
+                    buildConfig.m_maxCosAngleForBevelPlanes = -0.1f;
 
                     hkpConvexVerticesShape *newShape = hkAllocReferencedObject<hkpConvexVerticesShape>();
                     hkpConvexVerticesShape_ctor(newShape, newVerts, buildConfig); // sets refcount to 1
