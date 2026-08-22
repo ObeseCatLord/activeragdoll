@@ -1893,7 +1893,7 @@ struct PhysicsListener :
             localEvent.impulseMultiplier = impulseMult;
             localEvent.flags = (hitActor ? 1u : 0u) | (isLeft ? 2u : 0u) | (isOffhand ? 4u : 0u) | (isTwoHanding ? 8u : 0u) | (isStab ? 16u : 0u);
             if (NiPointer<NiAVObject> hitNode = GetNodeFromCollidable(hitRigidBody->getCollidable())) {
-                if (CopyLocalNodeName002(localEvent.nodeName, sizeof(localEvent.nodeName), hitNode->m_name.cString())) {
+                if (CopyLocalNodeName002(localEvent.nodeName, sizeof(localEvent.nodeName), hitNode->m_name)) {
                     g_interface002.EnqueueLocalPhysicalEvent(localEvent);
                 }
             }
@@ -4274,7 +4274,7 @@ namespace {
         NiPointer<NiNode> root = actor->GetNiNode();
         if (!root || !FindRigidBody(root, heldRigidBody)) return false;
         NiPointer<NiAVObject> node = GetNodeFromCollidable(heldRigidBody->hkBody->getCollidable());
-        if (!node || !CopyLocalNodeName002(event.nodeName, sizeof(event.nodeName), node->m_name.cString())) return false;
+        if (!node || !CopyLocalNodeName002(event.nodeName, sizeof(event.nodeName), node->m_name)) return false;
 
         hkpRigidBody *body = heldRigidBody->hkBody;
         const NiPoint3 position = HkVectorToNiPoint(body->getCenterOfMassInWorld()) * *g_inverseHavokWorldScale;
