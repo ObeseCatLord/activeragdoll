@@ -340,12 +340,11 @@ PlanckResult002 PlanckInterface002::Enqueue(RemoteCommand002 command, const Plan
         if ((overflowRequests & (overflowRequests - 1)) == 0) _MESSAGE("PLANCK interface 002 queue overflow (%u rejections)", overflowRequests);
         return Result002(PlanckResultCode002::QueueFull);
     }
-    // Reserve every container before consuming a sequence or mutating any
-    // structure. If allocation fails here the caller gets an explicit
-    // AllocationFailure and no partial admission survives.
+    // The unordered_map can pre-reserve to surface allocation failure before
+    // any mutation. The std::deque containers allocate per node and have no
+    // reserve(); their pushes below are wrapped in a try/catch that rolls back
+    // to the exact prior counts on allocation failure instead.
     try {
-        seenEvents.reserve(seenEvents.size() + 1);
-        remoteCommands.reserve(remoteCommands.size() + 1);
         if (addGripAdmission) gripAdmissions.reserve(gripAdmissions.size() + 1);
     }
     catch (...) {
