@@ -7,7 +7,9 @@
 #include "utils.h"
 #include "math_utils.h"
 
-hkMemoryRouter &hkGetMemoryRouter()
+const hkQuadReal hkQuadRealMinusHalf = { -0.5f, -0.5f, -0.5f, -0.5f };
+
+hkMemoryRouter &HK_CALL hkGetMemoryRouter()
 {
     return *(hkMemoryRouter *)(hkUlong)TlsGetValue(*g_havokMemoryRouterTlsIndex);
 }

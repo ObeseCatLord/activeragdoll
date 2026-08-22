@@ -385,7 +385,7 @@ inline bool IsMoveableEntity(hkpEntity *entity) { return IsMotionTypeMoveable(en
 
 NiPoint3 hkpRigidBody_getPointVelocity(const hkpRigidBody *body, const hkVector4 &pos);
 
-hkMemoryRouter &hkGetMemoryRouter();
+hkMemoryRouter &HK_CALL hkGetMemoryRouter();
 inline void *hkHeapAlloc(int numBytes) {
     return hkGetMemoryRouter().heap().blockAlloc(numBytes);
 }
@@ -456,4 +456,3 @@ bhkRagdollConstraint *ConvertToRagdollConstraint(bhkConstraint *constraint);
 
 typedef void (*_hkp3AxisSweep_removeObject)(hkp3AxisSweep *, hkpBroadPhaseHandle *, hkArray<hkpBroadPhaseHandlePair> *);
 typedef void (*_hkp3AxisSweep_removeObjectBatch)(hkp3AxisSweep *, hkArrayBase<hkpBroadPhaseHandle *> *, hkArray<hkpBroadPhaseHandlePair> *);
-
