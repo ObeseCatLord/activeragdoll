@@ -160,6 +160,9 @@
   <ItemGroup>
     <ProjectReference Include="$(SKSEVRSourceRoot)\skse64\skse64.vcxproj">
       <Project>{7028b79c-06e3-4d9a-b38c-1dc3680b1bdb}</Project>
+      <!-- Build SKSEVR for header/source compatibility, but it is a loader
+           DLL without an import library and is not a PLANCK link input. -->
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
     </ProjectReference>
     <ProjectReference Include="$(SKSEVRSourceRoot)\skse64_common\skse64_common.vcxproj">
       <Project>{5fd1c08d-db80-480c-a1c6-f0920005cd13}</Project>
