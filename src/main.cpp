@@ -5,6 +5,7 @@
 #include <deque>
 #include <optional>
 #include <shared_mutex>
+#include <chrono>
 
 #include <Physics/Collide/Shape/Convex/ConvexVertices/hkpConvexVerticesShape.h>
 #include <Physics/Collide/Shape/Convex/Capsule/hkpCapsuleShape.h>
@@ -312,6 +313,16 @@ void UpdateCollisionFilterOnAllBones(Actor *actor)
 }
 
 std::vector<std::unique_ptr<GenericJob>> g_prePhysicsStepJobs{};
+
+void ProcessRemotePhysics002();
+void ResetRemotePhysics002();
+namespace {
+    bool ShouldSuppressLocalPhysicalEvent002(UInt32 targetFormId);
+    bool CopyLocalNodeName002(char (&destination)[PlanckPluginAPI::kPlanckInterface002NodeNameCapacity], const char *source);
+    void TrackLocalRagdollEnter002(Actor *actor, const NiPoint3 &sourcePosition);
+    void UpdateLocalActorPhysicalEvents002();
+    void ResetLocalActorPhysicalEvents002();
+}
 
 template<class T, typename... Args>
 void QueuePrePhysicsJob(Args&&... args)
@@ -1863,6 +1874,25 @@ struct PhysicsListener :
 
         Actor *hitActor = DYNAMIC_CAST(hitRefr, TESObjectREFR, Actor);
 
+        // Remote ApplyHitImpulse does not call DoHit, but its later contacts can reach here; suppress that bounded echo window only.
+        // PLANCK's local lane is actor/ragdoll-only; HIGGS owns ordinary
+        // world-object replication.
+        if (hitActor && !ShouldSuppressLocalPhysicalEvent002(hitRefr->formID)) {
+            PlanckPluginAPI::PlanckLocalPhysicalEvent002 localEvent{};
+            localEvent.targetFormId = hitRefr->formID;
+            localEvent.kind = PlanckPluginAPI::PlanckLocalPhysicalEventKind002::HitImpulse;
+            localEvent.rotation.w = 1.f;
+            localEvent.position = { hitPosition.x, hitPosition.y, hitPosition.z };
+            localEvent.velocity = { hitVelocity.x, hitVelocity.y, hitVelocity.z };
+            localEvent.impulseMultiplier = impulseMult;
+            localEvent.flags = (hitActor ? 1u : 0u) | (isLeft ? 2u : 0u) | (isOffhand ? 4u : 0u) | (isTwoHanding ? 8u : 0u) | (isStab ? 16u : 0u);
+            if (NiPointer<NiAVObject> hitNode = GetNodeFromCollidable(hitRigidBody->getCollidable())) {
+                if (CopyLocalNodeName002(localEvent.nodeName, hitNode->m_name.cString())) {
+                    g_interface002.EnqueueLocalPhysicalEvent(localEvent);
+                }
+            }
+        }
+
         hitCooldownTargets[isLeft][hitRefr] = { g_currentFrameTime, g_currentFrameTime, hitActor != nullptr };
 
         if (hitActor && !Actor_IsGhost(hitActor) && Actor_CanHit(player, hitActor)) {
@@ -2740,6 +2770,8 @@ void PrePhysicsStepCallback(void *world)
     // This hook is after all ragdolls' driveToPose(), and before the hkpWorld physics step
 
     // At this point we can apply any impulses / velocity adjustments without fear of them being overwritten
+
+    ProcessRemotePhysics002();
 
     for (auto &job : g_prePhysicsStepJobs) {
         job->Run();
@@ -4006,6 +4038,7 @@ void ResetObjects()
     g_shovedActors.clear();
     g_footYankedActors.clear();
     g_physicsListener = PhysicsListener{};
+    ResetRemotePhysics002();
 
     // Easier to signal updateManifold() to clear related objects so we don't have to lock here.
     g_clearUpdateManifoldObjects = true;
@@ -4066,14 +4099,477 @@ void PlayRagdollSound(Actor *actor)
     }
 }
 
-void RagdollActor(Actor *actor)
+void RagdollActorFromPosition(Actor *actor, const NiPoint3 &sourcePosition, bool playSound)
 {
     if (ActorProcessManager *process = actor->processManager) {
-        if (Config::options.playRagdollSound) {
+        if (playSound && Config::options.playRagdollSound) {
             PlayRagdollSound(actor);
         }
-        ActorProcess_PushActorAway(process, actor, (*g_thePlayer)->pos, 0.f);
+        ActorProcess_PushActorAway(process, actor, sourcePosition, 0.f);
     }
+}
+
+void RagdollActor(Actor *actor)
+{
+    if (!actor) return;
+    const NiPoint3 sourcePosition = (*g_thePlayer)->pos;
+    if (!Actor_IsInRagdollState(actor) && !ShouldSuppressLocalPhysicalEvent002(actor->formID)) {
+        TrackLocalRagdollEnter002(actor, sourcePosition);
+    }
+    RagdollActorFromPosition(actor, sourcePosition, true);
+}
+
+namespace {
+    constexpr size_t kRemoteGripLimit002 = 128;
+    constexpr size_t kRemoteReplaySuppressionLimit002 = 256;
+    constexpr double kRemoteReplaySuppressionSeconds002 = 0.25;
+    constexpr double kRemoteGripActivationGraceSeconds002 = 2.0;
+    constexpr float kRemoteGripPositionGain002 = 8.f;
+    constexpr float kRemoteGripMaxDeltaVelocity002 = 15.f;
+    constexpr float kRemoteGripMaxLinearImpulse002 = 400.f;
+    constexpr float kRemoteGripMaxAngularImpulse002 = 80.f;
+    constexpr size_t kLocalRagdollStateLimit002 = 256;
+    constexpr double kLocalRagdollActivationGraceSeconds002 = 2.0;
+    constexpr double kLocalGripUpdateIntervalSeconds002 = 1.0 / 20.0;
+    constexpr float kLocalGripTtlSeconds002 = 0.2f;
+
+    struct LocalActorGrip002 {
+        UInt64 gripId = 0;
+        UInt32 targetFormId = 0;
+        double nextUpdateAt = 0.0;
+        bool active = false;
+    };
+    struct LocalRagdollState002 {
+        double enteredAt = 0.0;
+        bool observedRagdoll = false;
+    };
+
+    LocalActorGrip002 g_localActorGrips002[2];
+    std::unordered_map<UInt32, LocalRagdollState002> g_localRagdollStates002;
+    UInt64 g_nextLocalGripId002 = 1;
+    UInt32 g_localPhysicalEventRejected002 = 0;
+
+    struct RemoteGripKey002 {
+        UInt64 sourceSession;
+        UInt64 gripId;
+        bool operator==(const RemoteGripKey002 &other) const { return sourceSession == other.sourceSession && gripId == other.gripId; }
+    };
+    struct RemoteGripKeyHash002 {
+        size_t operator()(const RemoteGripKey002 &key) const { return std::hash<UInt64>{}(key.sourceSession) ^ (std::hash<UInt64>{}(key.gripId) << 1); }
+    };
+    struct RemoteGripController002 {
+        UInt32 targetFormId;
+        UInt32 refrHandle;
+        char nodeName[PlanckPluginAPI::kPlanckInterface002NodeNameCapacity]{};
+        PlanckPluginAPI::PlanckRemoteGripState002 state{};
+        double expiresAt;
+        double activationDeadline;
+        bool hasActivated;
+    };
+
+    struct RemoteReplaySuppression002 {
+        UInt32 targetFormId;
+        double expiresAt;
+    };
+
+    std::unordered_map<RemoteGripKey002, RemoteGripController002, RemoteGripKeyHash002> g_remoteGripControllers002;
+    std::deque<RemoteReplaySuppression002> g_remoteReplaySuppressions002;
+    std::mutex g_remoteReplaySuppressionsLock002;
+    UInt32 g_remoteGripRejected002 = 0;
+
+    void LogRemoteGripRejected002()
+    {
+        ++g_remoteGripRejected002;
+        if ((g_remoteGripRejected002 & (g_remoteGripRejected002 - 1)) == 0) _MESSAGE("PLANCK interface 002 remote grip controller limit reached (%u drops)", g_remoteGripRejected002);
+    }
+
+    void LogLocalPhysicalEventRejected002()
+    {
+        ++g_localPhysicalEventRejected002;
+        if ((g_localPhysicalEventRejected002 & (g_localPhysicalEventRejected002 - 1)) == 0) {
+            _MESSAGE("PLANCK interface 002 local physical event capture rejected (%u drops)", g_localPhysicalEventRejected002);
+        }
+    }
+
+    bool CopyLocalNodeName002(char (&destination)[PlanckPluginAPI::kPlanckInterface002NodeNameCapacity], const char *source)
+    {
+        if (!source) return false;
+        for (UInt32 i = 0; i + 1 < PlanckPluginAPI::kPlanckInterface002NodeNameCapacity; ++i) {
+            const unsigned char character = static_cast<unsigned char>(source[i]);
+            if (character == '\0') return i != 0;
+            if (character < 0x20 || character == 0x7f) return false;
+            destination[i] = static_cast<char>(character);
+        }
+        // Reject rather than alias two distinct long node paths to the same
+        // truncated identity.
+        return false;
+    }
+
+    PlanckPluginAPI::PlanckLocalPhysicalEvent002 MakeLocalEvent002(PlanckPluginAPI::PlanckLocalPhysicalEventKind002 kind, UInt32 targetFormId)
+    {
+        PlanckPluginAPI::PlanckLocalPhysicalEvent002 event{};
+        event.kind = kind;
+        event.targetFormId = targetFormId;
+        event.rotation.w = 1.f;
+        return event;
+    }
+
+    UInt64 NextLocalGripId002()
+    {
+        const UInt64 id = g_nextLocalGripId002++;
+        if (g_nextLocalGripId002 == 0) ++g_nextLocalGripId002;
+        return id == 0 ? NextLocalGripId002() : id;
+    }
+
+    NiPoint3 ToNiPoint002(const PlanckPluginAPI::PlanckVector3_002 &value) { return { value.x, value.y, value.z }; }
+
+    double ReplayClockSeconds002()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void MarkRemoteReplaySuppression002(UInt32 targetFormId)
+    {
+        std::scoped_lock lock(g_remoteReplaySuppressionsLock002);
+        const double now = ReplayClockSeconds002();
+        const double expiresAt = now + kRemoteReplaySuppressionSeconds002;
+        for (auto &entry : g_remoteReplaySuppressions002) {
+            if (entry.targetFormId == targetFormId) { entry.expiresAt = expiresAt; return; }
+        }
+        while (!g_remoteReplaySuppressions002.empty() && g_remoteReplaySuppressions002.front().expiresAt <= now) {
+            g_remoteReplaySuppressions002.pop_front();
+        }
+        if (g_remoteReplaySuppressions002.size() >= kRemoteReplaySuppressionLimit002) g_remoteReplaySuppressions002.pop_front();
+        g_remoteReplaySuppressions002.push_back({ targetFormId, expiresAt });
+    }
+
+    bool ShouldSuppressLocalPhysicalEvent002(UInt32 targetFormId)
+    {
+        std::scoped_lock lock(g_remoteReplaySuppressionsLock002);
+        const double now = ReplayClockSeconds002();
+        for (auto it = g_remoteReplaySuppressions002.begin(); it != g_remoteReplaySuppressions002.end();) {
+            if (it->expiresAt <= now) it = g_remoteReplaySuppressions002.erase(it);
+            else {
+                if (it->targetFormId == targetFormId) return true;
+                ++it;
+            }
+        }
+        return false;
+    }
+
+    bool FillLocalGripState002(UInt32 handIndex, Actor *actor, PlanckPluginAPI::PlanckLocalPhysicalEvent002 &event)
+    {
+        bhkRigidBody *heldRigidBody = handIndex == 1 ? g_leftHeldRigidBody : g_rightHeldRigidBody;
+        if (!actor || !heldRigidBody || !heldRigidBody->hkBody || !heldRigidBody->hkBody->m_world) return false;
+        NiPointer<NiNode> root = actor->GetNiNode();
+        if (!root || !FindRigidBody(root, heldRigidBody)) return false;
+        NiPointer<NiAVObject> node = GetNodeFromCollidable(heldRigidBody->hkBody->getCollidable());
+        if (!node || !CopyLocalNodeName002(event.nodeName, node->m_name.cString())) return false;
+
+        hkpRigidBody *body = heldRigidBody->hkBody;
+        const NiPoint3 position = HkVectorToNiPoint(body->getCenterOfMassInWorld()) * *g_inverseHavokWorldScale;
+        const NiPoint3 linearVelocity = HkVectorToNiPoint(body->getLinearVelocity()) * *g_inverseHavokWorldScale;
+        const NiPoint3 angularVelocity = HkVectorToNiPoint(body->getAngularVelocity());
+        const NiQuaternion rotation = HkQuatToNiQuat(body->getRotation());
+        event.position = { position.x, position.y, position.z };
+        event.rotation = { rotation.m_fX, rotation.m_fY, rotation.m_fZ, rotation.m_fW };
+        event.linearVelocity = { linearVelocity.x, linearVelocity.y, linearVelocity.z };
+        event.angularVelocity = { angularVelocity.x, angularVelocity.y, angularVelocity.z };
+        event.ttlSeconds = kLocalGripTtlSeconds002;
+        return true;
+    }
+
+    void EnqueueLocalGripEnd002(const LocalActorGrip002 &grip)
+    {
+        if (!grip.active || grip.gripId == 0 || grip.targetFormId == 0) return;
+        auto event = MakeLocalEvent002(PlanckPluginAPI::PlanckLocalPhysicalEventKind002::GripEnd, grip.targetFormId);
+        event.gripId = grip.gripId;
+        g_interface002.EnqueueLocalPhysicalEvent(event);
+    }
+
+    void UpdateLocalActorPhysicalEvents002()
+    {
+        for (UInt32 handIndex = 0; handIndex < 2; ++handIndex) {
+            TESObjectREFR *heldRefr = handIndex == 1 ? g_leftHeldRefr : g_rightHeldRefr;
+            Actor *actor = heldRefr ? DYNAMIC_CAST(heldRefr, TESObjectREFR, Actor) : nullptr;
+            LocalActorGrip002 &grip = g_localActorGrips002[handIndex];
+            const UInt32 targetFormId = actor ? actor->formID : 0;
+
+            if (grip.active && (!actor || targetFormId != grip.targetFormId)) {
+                EnqueueLocalGripEnd002(grip);
+                grip = {};
+            }
+            if (!actor || targetFormId == 0 || ShouldSuppressLocalPhysicalEvent002(targetFormId)) continue;
+
+            const auto kind = grip.active ? PlanckPluginAPI::PlanckLocalPhysicalEventKind002::GripUpdate :
+                PlanckPluginAPI::PlanckLocalPhysicalEventKind002::GripBegin;
+            if (grip.active && g_currentFrameTime < grip.nextUpdateAt) continue;
+            auto event = MakeLocalEvent002(kind, targetFormId);
+            if (!FillLocalGripState002(handIndex, actor, event)) {
+                LogLocalPhysicalEventRejected002();
+                continue;
+            }
+            if (!grip.active) {
+                grip.gripId = NextLocalGripId002();
+                grip.targetFormId = targetFormId;
+                grip.active = true;
+            }
+            event.gripId = grip.gripId;
+            g_interface002.EnqueueLocalPhysicalEvent(event);
+            grip.nextUpdateAt = g_currentFrameTime + kLocalGripUpdateIntervalSeconds002;
+        }
+
+        for (auto it = g_localRagdollStates002.begin(); it != g_localRagdollStates002.end();) {
+            Actor *actor = DYNAMIC_CAST(LookupFormByID(it->first), TESObjectREFR, Actor);
+            if (!actor || ShouldSuppressLocalPhysicalEvent002(it->first)) {
+                it = g_localRagdollStates002.erase(it);
+                continue;
+            }
+            const bool isRagdolled = Actor_IsInRagdollState(actor);
+            it->second.observedRagdoll = it->second.observedRagdoll || isRagdolled;
+            if (it->second.observedRagdoll && !isRagdolled) {
+                g_interface002.EnqueueLocalPhysicalEvent(MakeLocalEvent002(PlanckPluginAPI::PlanckLocalPhysicalEventKind002::RagdollExit, it->first));
+                it = g_localRagdollStates002.erase(it);
+            }
+            else if (!it->second.observedRagdoll && g_currentFrameTime - it->second.enteredAt >= kLocalRagdollActivationGraceSeconds002) {
+                it = g_localRagdollStates002.erase(it);
+            }
+            else ++it;
+        }
+    }
+
+    void TrackLocalRagdollEnter002(Actor *actor, const NiPoint3 &sourcePosition)
+    {
+        if (!actor || actor->formID == 0 || g_localRagdollStates002.contains(actor->formID)) return;
+        if (g_localRagdollStates002.size() >= kLocalRagdollStateLimit002) {
+            LogLocalPhysicalEventRejected002();
+            return;
+        }
+        auto event = MakeLocalEvent002(PlanckPluginAPI::PlanckLocalPhysicalEventKind002::RagdollEnter, actor->formID);
+        event.sourcePosition = { sourcePosition.x, sourcePosition.y, sourcePosition.z };
+        g_interface002.EnqueueLocalPhysicalEvent(event);
+        g_localRagdollStates002.emplace(actor->formID, LocalRagdollState002{ g_currentFrameTime, false });
+    }
+
+    void ResetLocalActorPhysicalEvents002()
+    {
+        for (auto &grip : g_localActorGrips002) {
+            EnqueueLocalGripEnd002(grip);
+            grip = {};
+        }
+        g_localRagdollStates002.clear();
+    }
+
+    NiPoint3 ClampMagnitude002(const NiPoint3 &value, float maximum)
+    {
+        const float length = VectorLength(value);
+        return length > maximum && length > 0.f ? value * (maximum / length) : value;
+    }
+
+    void RemoveRemoteGripForTarget002(UInt32 targetFormId)
+    {
+        for (auto it = g_remoteGripControllers002.begin(); it != g_remoteGripControllers002.end();) {
+            if (it->second.targetFormId == targetFormId) it = g_remoteGripControllers002.erase(it);
+            else ++it;
+        }
+        g_interface002.ForgetRemoteTarget(targetFormId);
+    }
+
+    bool ResolveRemoteActor002(UInt32 formId, Actor *&actor)
+    {
+        actor = nullptr;
+        TESForm *form = LookupFormByID(formId);
+        actor = form ? DYNAMIC_CAST(form, TESObjectREFR, Actor) : nullptr;
+        return actor != nullptr;
+    }
+
+    NiPointer<bhkRigidBody> ResolveRemoteNodeRigidBody002(NiNode *root, const char *nodeName)
+    {
+        BSFixedString fixedNodeName(nodeName);
+        NiPointer<NiAVObject> node = root->GetObjectByName(&fixedNodeName.data);
+        if (!node) return nullptr;
+        NiPointer<bhkRigidBody> rigidBody = GetRigidBody(node);
+        if (!rigidBody) {
+            if (NiPointer<NiAVObject> collisionNode = GetClosestParentWithCollision(node, false, false)) rigidBody = GetRigidBody(collisionNode);
+        }
+        return rigidBody;
+    }
+
+    bool ApplyRemoteGripDrive002(RemoteGripController002 &controller, Actor *actor)
+    {
+        NiPointer<bhkWorld> world = GetHavokWorldFromCell(actor->parentCell);
+        if (!world) return false;
+
+        // This runs from PrePhysicsStepCallback, before Havok advances. The
+        // supplied Havok 2010.2 headers mark hkpMotion impulse application as
+        // a read/write operation, so it must not execute under BSReadLocker.
+        // Keep the existing object -> world resolution order, but rely on the
+        // pre-physics callback's mutation-safe phase just as queued impulses do.
+        NiPointer<NiNode> root = actor->GetNiNode();
+        if (!root) return false;
+        BSFixedString nodeName(controller.nodeName);
+        NiPointer<NiAVObject> node = root->GetObjectByName(&nodeName.data);
+        if (!node) return false;
+        NiPointer<bhkRigidBody> rigidBody = GetRigidBody(node);
+        if (!rigidBody) {
+            if (NiPointer<NiAVObject> collisionNode = GetClosestParentWithCollision(node, false, false)) rigidBody = GetRigidBody(collisionNode);
+        }
+        if (!rigidBody || !FindRigidBody(root, rigidBody) || !rigidBody->hkBody || !rigidBody->hkBody->m_world) return false;
+
+        MarkRemoteReplaySuppression002(controller.targetFormId);
+        hkpRigidBody *body = rigidBody->hkBody;
+        hkpEntity_activate(body);
+        const NiPoint3 targetPosition = ToNiPoint002(controller.state.worldPosition) * *g_havokWorldScale;
+        const NiPoint3 positionError = targetPosition - HkVectorToNiPoint(body->getCenterOfMassInWorld());
+        const NiPoint3 desiredVelocity = ToNiPoint002(controller.state.linearVelocity) * *g_havokWorldScale +
+            ClampMagnitude002(positionError * kRemoteGripPositionGain002, kRemoteGripMaxDeltaVelocity002);
+        const NiPoint3 currentVelocity = HkVectorToNiPoint(body->getLinearVelocity());
+        const NiPoint3 deltaVelocity = ClampMagnitude002(desiredVelocity - currentVelocity, kRemoteGripMaxDeltaVelocity002);
+        const float massInv = body->getMassInv();
+        if (massInv > 0.001f) {
+            const float mass = 1.f / massInv;
+            body->m_motion.applyLinearImpulse(NiPointToHkVector(ClampMagnitude002(deltaVelocity * mass, kRemoteGripMaxLinearImpulse002)));
+        }
+
+        const hkQuaternion currentRotation = body->getRotation();
+        NiQuaternion targetRotation{ controller.state.worldRotation.w, controller.state.worldRotation.x, controller.state.worldRotation.y, controller.state.worldRotation.z };
+        NiQuaternion rotationError = QuaternionMultiply(targetRotation, QuaternionInverse(HkQuatToNiQuat(currentRotation)));
+        if (rotationError.m_fW < 0.f) rotationError = QuaternionMultiply(rotationError, -1.f);
+        const float halfAngle = acosf(std::clamp(rotationError.m_fW, -1.f, 1.f));
+        NiPoint3 rotationalVelocity = ToNiPoint002(controller.state.angularVelocity);
+        const float sinHalfAngle = sinf(halfAngle);
+        if (sinHalfAngle > 0.001f) {
+            const NiPoint3 axis{ rotationError.m_fX / sinHalfAngle, rotationError.m_fY / sinHalfAngle, rotationError.m_fZ / sinHalfAngle };
+            rotationalVelocity += axis * std::min(halfAngle * 2.f * kRemoteGripPositionGain002, kRemoteGripMaxDeltaVelocity002);
+        }
+        const NiPoint3 angularDelta = ClampMagnitude002(rotationalVelocity - HkVectorToNiPoint(body->getAngularVelocity()), kRemoteGripMaxDeltaVelocity002);
+        body->m_motion.applyAngularImpulse(NiPointToHkVector(ClampMagnitude002(angularDelta, kRemoteGripMaxAngularImpulse002)));
+        return true;
+    }
+}
+
+void ProcessRemotePhysics002()
+{
+    const UInt64 cancellationGeneration = g_interface002.GetCancellationGeneration();
+    std::vector<PlanckPluginAPI::RemoteCommand002> commands;
+    g_interface002.DrainRemoteCommands(commands);
+    for (const auto &command : commands) {
+        // ClearRemoteSession marks cancellation under the producer lock before
+        // draining commands. A copied-but-not-yet-applied mutation must still
+        // lose to that cancellation.
+        if (g_interface002.IsRemoteSessionCancelled(command.SourceSession())) continue;
+        switch (command.type) {
+        case PlanckPluginAPI::RemoteCommandType002::HitImpulse: {
+            const auto &request = command.request.hitImpulse;
+            Actor *actor = nullptr;
+            if (!ResolveRemoteActor002(request.targetFormId, actor)) { g_interface002.ForgetRemoteTarget(request.targetFormId); break; }
+            NiPointer<NiNode> root = actor->GetNiNode();
+            NiPointer<bhkWorld> world = GetHavokWorldFromCell(actor->parentCell);
+            if (!root || !world) { g_interface002.ForgetRemoteTarget(request.targetFormId); break; }
+            if (NiPointer<bhkRigidBody> body = ResolveRemoteNodeRigidBody002(root, request.nodeName)) {
+                MarkRemoteReplaySuppression002(request.targetFormId);
+                ApplyHitImpulse(world, actor, body, ToNiPoint002(request.velocity), ToNiPoint002(request.position) * *g_havokWorldScale, request.impulseMultiplier);
+            }
+            break;
+        }
+        case PlanckPluginAPI::RemoteCommandType002::Ragdoll: {
+            const auto &request = command.request.ragdoll;
+            Actor *actor = nullptr;
+            if (ResolveRemoteActor002(request.targetFormId, actor) && actor->GetNiNode()) {
+                MarkRemoteReplaySuppression002(request.targetFormId);
+                RagdollActorFromPosition(actor, ToNiPoint002(request.sourcePosition), false);
+            }
+            else g_interface002.ForgetRemoteTarget(request.targetFormId);
+            break;
+        }
+        case PlanckPluginAPI::RemoteCommandType002::RagdollExit:
+            RemoveRemoteGripForTarget002(command.request.ragdollExit.targetFormId);
+            break;
+        case PlanckPluginAPI::RemoteCommandType002::BeginGrip: {
+            const auto &request = command.request.beginGrip;
+            Actor *actor = nullptr;
+            const RemoteGripKey002 key{ request.header.sourceSession, request.gripId };
+            if (!ResolveRemoteActor002(request.targetFormId, actor) || !actor->GetNiNode()) { g_interface002.ForgetRemoteTarget(request.targetFormId); break; }
+            const auto existing = g_remoteGripControllers002.find(key);
+            if (existing != g_remoteGripControllers002.end() && existing->second.targetFormId != request.targetFormId) {
+                // A producer+GripId is bound to one target for its lifetime;
+                // never retarget a duplicate Begin on the game thread.
+                LogRemoteGripRejected002();
+                break;
+            }
+            if (existing == g_remoteGripControllers002.end() && g_remoteGripControllers002.size() >= kRemoteGripLimit002) { LogRemoteGripRejected002(); break; }
+            RemoteGripController002 controller{};
+            controller.targetFormId = request.targetFormId;
+            controller.refrHandle = GetOrCreateRefrHandle(actor);
+            for (UInt32 i = 0; i < PlanckPluginAPI::kPlanckInterface002NodeNameCapacity; ++i) controller.nodeName[i] = request.nodeName[i];
+            controller.state = request.state;
+            controller.expiresAt = g_currentFrameTime + request.state.ttlSeconds;
+            controller.activationDeadline = g_currentFrameTime + kRemoteGripActivationGraceSeconds002;
+            controller.hasActivated = Actor_IsInRagdollState(actor);
+            g_remoteGripControllers002[key] = controller;
+            break;
+        }
+        case PlanckPluginAPI::RemoteCommandType002::UpdateGrip: {
+            const auto &request = command.request.updateGrip;
+            auto it = g_remoteGripControllers002.find({ request.header.sourceSession, request.gripId });
+            if (it != g_remoteGripControllers002.end()) {
+                if (it->second.targetFormId != request.targetFormId) break;
+                it->second.state = request.state;
+                it->second.expiresAt = g_currentFrameTime + request.state.ttlSeconds;
+            }
+            break;
+        }
+        case PlanckPluginAPI::RemoteCommandType002::EndGrip: {
+            const auto &request = command.request.endGrip;
+            const auto existing = g_remoteGripControllers002.find({ request.header.sourceSession, request.gripId });
+            if (existing != g_remoteGripControllers002.end() && existing->second.targetFormId == request.targetFormId)
+                g_remoteGripControllers002.erase(existing);
+            break;
+        }
+        }
+    }
+
+    for (auto it = g_remoteGripControllers002.begin(); it != g_remoteGripControllers002.end();) {
+        RemoteGripController002 &controller = it->second;
+        NiPointer<TESObjectREFR> refr;
+        Actor *actor = LookupREFRByHandle(controller.refrHandle, refr) ? DYNAMIC_CAST(refr, TESObjectREFR, Actor) : nullptr;
+        if (g_interface002.IsRemoteSessionCancelled(it->first.sourceSession) || !actor || !actor->GetNiNode() || g_currentFrameTime >= controller.expiresAt) {
+            const UInt32 targetFormId = controller.targetFormId;
+            it = g_remoteGripControllers002.erase(it);
+            g_interface002.ForgetRemoteTarget(targetFormId);
+            continue;
+        }
+        const bool isRagdolled = Actor_IsInRagdollState(actor);
+        if (!isRagdolled) {
+            if (!controller.hasActivated && g_currentFrameTime < controller.activationDeadline) { ++it; continue; }
+            const UInt32 targetFormId = controller.targetFormId;
+            it = g_remoteGripControllers002.erase(it);
+            g_interface002.ForgetRemoteTarget(targetFormId);
+            continue;
+        }
+        controller.hasActivated = true;
+        if (!ApplyRemoteGripDrive002(controller, actor)) {
+            const UInt32 targetFormId = controller.targetFormId;
+            it = g_remoteGripControllers002.erase(it);
+            g_interface002.ForgetRemoteTarget(targetFormId);
+        }
+        else ++it;
+    }
+    g_interface002.CompleteCancellationSweep(cancellationGeneration);
+}
+
+void ResetRemotePhysics002()
+{
+    // Ends use only retained scalar IDs, so world teardown never dereferences a
+    // stale actor or rigid-body pointer. ResetRemoteState intentionally keeps
+    // these terminal local events available to the bridge.
+    ResetLocalActorPhysicalEvents002();
+    g_remoteGripControllers002.clear();
+    {
+        std::scoped_lock lock(g_remoteReplaySuppressionsLock002);
+        g_remoteReplaySuppressions002.clear();
+    }
+    g_interface002.ResetRemoteState();
 }
 
 
@@ -4296,6 +4792,8 @@ void UpdateHiggsInfo(bhkWorld *world)
     if (!g_leftHeldRigidBody && g_prevLeftHeldRigidBody) {
         g_letGoHandData[1] = { g_controllerData[1].GetMaxRecentVelocity(), g_prevLeftHeldRefr, g_prevLeftHeldRigidBody, g_currentFrameTime };
     }
+
+    UpdateLocalActorPhysicalEvents002();
 }
 
 int GetMoveStartEventId(Actor *actor)
@@ -8374,4 +8872,3 @@ extern "C" {
         return true;
     }
 };
-

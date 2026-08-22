@@ -41,26 +41,32 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <_ProjectFileVersion>12.0.21005.1</_ProjectFileVersion>
+    <!-- Set these with /p:... (the Windows wrapper supplies them from DependencyRoot). -->
+    <Havok2010Source Condition="'$(Havok2010Source)'==''"></Havok2010Source>
+    <SKSEVRSourceRoot Condition="'$(SKSEVRSourceRoot)'==''"></SKSEVRSourceRoot>
+    <SKSECommonSourceRoot Condition="'$(SKSECommonSourceRoot)'==''"></SKSECommonSourceRoot>
+    <SkyrimVRPath Condition="'$(SkyrimVRPath)'==''"></SkyrimVRPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
     <PostBuildEventUseInBuild>true</PostBuildEventUseInBuild>
     <PreBuildEventUseInBuild>false</PreBuildEventUseInBuild>
     <PreLinkEventUseInBuild>false</PreLinkEventUseInBuild>
-    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
-    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Users\adamh\Documents\hk2010_2_0_r1\Source</IncludePath>
+    <OutDir>$(ProjectDir)$(Platform)\$(Configuration)\</OutDir>
+    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(Havok2010Source);$(SKSEVRSourceRoot);$(SKSECommonSourceRoot)\..</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <PostBuildEventUseInBuild>true</PostBuildEventUseInBuild>
     <PreBuildEventUseInBuild>false</PreBuildEventUseInBuild>
     <PreLinkEventUseInBuild>false</PreLinkEventUseInBuild>
-    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Users\adamh\Documents\hk2010_2_0_r1\Source</IncludePath>
+    <OutDir>$(ProjectDir)$(Platform)\$(Configuration)\</OutDir>
+    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(Havok2010Source);$(SKSEVRSourceRoot);$(SKSECommonSourceRoot)\..</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)..;$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;PLUGIN_EXAMPLE_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -96,7 +102,7 @@
       </Message>
     </PreBuildEvent>
     <PostBuildEvent>
-      <Command>copy /Y "$(TargetPath)" "C:\Program Files (x86)\Steam\steamapps\common\SkyrimVR\Data\SKSE\Plugins\$(TargetFileName)"</Command>
+      <Command>if not "$(SkyrimVRPath)"=="" (if not exist "$(SkyrimVRPath)\Data\SKSE\Plugins" mkdir "$(SkyrimVRPath)\Data\SKSE\Plugins" &amp; copy /Y "$(TargetPath)" "$(SkyrimVRPath)\Data\SKSE\Plugins\$(TargetFileName)")</Command>
     </PostBuildEvent>
     <PostBuildEvent>
       <Message>
@@ -107,7 +113,7 @@
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)..;$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;PLUGIN_EXAMPLE_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -145,17 +151,17 @@
     <PostBuildEvent>
       <Message>
       </Message>
-      <Command>copy /Y "$(TargetPath)" "C:\Program Files (x86)\Steam\steamapps\common\SkyrimVR\Data\SKSE\Plugins\$(TargetFileName)"</Command>
+      <Command>if not "$(SkyrimVRPath)"=="" (if not exist "$(SkyrimVRPath)\Data\SKSE\Plugins" mkdir "$(SkyrimVRPath)\Data\SKSE\Plugins" &amp; copy /Y "$(TargetPath)" "$(SkyrimVRPath)\Data\SKSE\Plugins\$(TargetFileName)")</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <None Include="exports.def" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\skse64\skse64.vcxproj">
+    <ProjectReference Include="$(SKSEVRSourceRoot)\skse64\skse64.vcxproj">
       <Project>{7028b79c-06e3-4d9a-b38c-1dc3680b1bdb}</Project>
     </ProjectReference>
-    <ProjectReference Include="..\skse64_common\skse64_common.vcxproj">
+    <ProjectReference Include="$(SKSEVRSourceRoot)\skse64_common\skse64_common.vcxproj">
       <Project>{5fd1c08d-db80-480c-a1c6-f0920005cd13}</Project>
     </ProjectReference>
   </ItemGroup>
@@ -185,6 +191,7 @@
     <ClInclude Include="include\menu_checker.h" />
     <ClInclude Include="include\papyrusapi.h" />
     <ClInclude Include="include\planckinterface001.h" />
+    <ClInclude Include="include\planckinterface002.h" />
     <ClInclude Include="include\pluginapi.h" />
     <ClInclude Include="include\RE\havok.h" />
     <ClInclude Include="include\RE\havok_behavior.h" />
@@ -193,6 +200,19 @@
     <ClInclude Include="include\utils.h" />
     <ClInclude Include="include\version.h" />
   </ItemGroup>
+  <Target Name="ValidatePlanckDependencies" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Havok2010Source)'==''" Text="Havok2010Source is required. Point it at the extracted hk2010_2_0_r1\\Source directory." />
+    <Error Condition="!Exists('$(Havok2010Source)\Common\Base\hkBase.h')" Text="Havok2010Source is invalid: expected Common\\Base\\hkBase.h under '$(Havok2010Source)'. Run prepare_planck_dependencies.ps1 with the caller-supplied hk2010_2_0_r1.7z archive." />
+    <Error Condition="!Exists('$(Havok2010Source)\Physics\Dynamics\Entity\hkpRigidBody.h')" Text="Havok2010Source is incomplete: expected Physics\\Dynamics\\Entity\\hkpRigidBody.h under '$(Havok2010Source)'. Extract Source\\Physics from the verified Havok archive." />
+    <Error Condition="!Exists('$(Havok2010Source)\Animation\Animation\Animation\hkaAnimation.h')" Text="Havok2010Source is incomplete: expected Animation\\Animation\\Animation\\hkaAnimation.h under '$(Havok2010Source)'. Extract Source\\Animation from the verified Havok archive." />
+    <Error Condition="'$(SKSEVRSourceRoot)'==''" Text="SKSEVRSourceRoot is required. Point it at sksevr_2_00_12\\src\\sksevr." />
+    <Error Condition="!Exists('$(SKSEVRSourceRoot)\skse64\PluginAPI.h')" Text="SKSEVRSourceRoot is invalid: expected skse64\\PluginAPI.h under '$(SKSEVRSourceRoot)'. Run prepare_planck_dependencies.ps1 to fetch the verified official SKSEVR 2.0.12 source." />
+    <Error Condition="!Exists('$(SKSEVRSourceRoot)\skse64_common\Relocation.h')" Text="SKSEVRSourceRoot is incomplete: expected skse64_common\\Relocation.h under '$(SKSEVRSourceRoot)'." />
+    <Error Condition="!Exists('$(SKSEVRSourceRoot)\skse64\skse64.vcxproj')" Text="SKSEVRSourceRoot is incomplete: expected skse64\\skse64.vcxproj under '$(SKSEVRSourceRoot)'." />
+    <Error Condition="!Exists('$(SKSEVRSourceRoot)\skse64_common\skse64_common.vcxproj')" Text="SKSEVRSourceRoot is incomplete: expected skse64_common\\skse64_common.vcxproj under '$(SKSEVRSourceRoot)'." />
+    <Error Condition="'$(SKSECommonSourceRoot)'==''" Text="SKSECommonSourceRoot is required. Point it at sksevr_2_00_12\\src\\common." />
+    <Error Condition="!Exists('$(SKSECommonSourceRoot)\IPrefix.h')" Text="SKSECommonSourceRoot is invalid: expected IPrefix.h under '$(SKSECommonSourceRoot)'." />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
