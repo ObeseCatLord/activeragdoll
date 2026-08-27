@@ -22,6 +22,9 @@ namespace PlanckPluginAPI {
         // Atomically drops locally captured events before a client lifecycle
         // generation is admitted for transmission.
         kPlanckFeature002_LocalEventRebase = 1ull << 4,
+        // Appended Interface002 telemetry surface.  Consumers must negotiate
+        // this bit before calling DequeueRemoteCompletionReceipt.
+        kPlanckFeature002_RemoteCompletionReceipts = 1ull << 5,
     };
 
     // Stable result contract: existing values never change or reorder.
@@ -121,6 +124,41 @@ namespace PlanckPluginAPI {
     };
 
     struct PlanckDequeueLocalPhysicalEventRequest002 { std::uint32_t size; std::uint32_t reserved; };
+    struct PlanckDequeueRemoteCompletionReceiptRequest002 { std::uint32_t size; std::uint32_t reserved; };
+
+    enum class PlanckRemoteCompletionKind002 : std::uint8_t {
+        HitImpulse = 1, Ragdoll, RagdollExit, GripBegin, GripUpdate, GripEnd, GripDrive,
+    };
+
+    // A receipt is emitted only after game/physics-thread processing.  A
+    // GripBeginAdmitted receipt means controller admission, never a physics
+    // drive; the first successful drive emits GripDriveApplied separately.
+    enum class PlanckRemoteCompletionStatus002 : std::uint8_t {
+        Applied = 1,
+        Cancelled,
+        TargetMissing,
+        RootUnavailable,
+        WorldUnavailable,
+        NodeUnavailable,
+        RigidBodyUnavailable,
+        InvalidState,
+        LeaseInvalid,
+        GripBeginAdmitted,
+        GripDriveApplied,
+    };
+
+    struct PlanckRemoteCompletionReceipt002 {
+        std::uint32_t size;
+        PlanckRemoteCompletionKind002 kind;
+        PlanckRemoteCompletionStatus002 status;
+        std::uint16_t reserved;
+        std::uint64_t sourceSession;
+        std::uint64_t eventId;
+        std::uint64_t sequence;
+        std::uint64_t gripId;
+        std::uint32_t targetFormId;
+        std::uint32_t reserved2;
+    };
 
     // The original hit fields remain the prefix. New fields are appended so an
     // older consumer can reject by size without misreading the hit payload.
@@ -170,6 +208,9 @@ namespace PlanckPluginAPI {
     static_assert(std::is_trivially_copyable<PlanckCapabilitiesRequest002>::value);
     static_assert(std::is_trivially_copyable<PlanckCapabilitiesResult002>::value);
     static_assert(std::is_trivially_copyable<PlanckDequeueLocalPhysicalEventRequest002>::value);
+    static_assert(std::is_trivially_copyable<PlanckDequeueRemoteCompletionReceiptRequest002>::value);
+    static_assert(std::is_trivially_copyable<PlanckRemoteCompletionReceipt002>::value);
+    static_assert(std::is_standard_layout<PlanckRemoteCompletionReceipt002>::value);
     static_assert(std::is_trivially_copyable<PlanckLocalPhysicalEvent002>::value);
     static_assert(std::is_standard_layout<PlanckLocalPhysicalEvent002>::value);
     static_assert(sizeof(PlanckLocalPhysicalEvent002) == 184);
@@ -194,6 +235,8 @@ namespace PlanckPluginAPI {
     static_assert(sizeof(PlanckCapabilitiesRequest002) == 0x08);
     static_assert(sizeof(PlanckCapabilitiesResult002) == 0x18);
     static_assert(sizeof(PlanckDequeueLocalPhysicalEventRequest002) == 0x08);
+    static_assert(sizeof(PlanckDequeueRemoteCompletionReceiptRequest002) == 0x08);
+    static_assert(sizeof(PlanckRemoteCompletionReceipt002) == 0x30);
     static_assert(sizeof(PlanckResult002) == 0x10);
 
     // noexcept is part of the method contract but not of the MSVC name
@@ -214,6 +257,9 @@ namespace PlanckPluginAPI {
         // Appended to preserve the interface002 prefix vtable layout used by
         // existing consumers. New consumers require the feature bit above.
         virtual PlanckResult002 DiscardLocalPhysicalEvents(const PlanckDiscardLocalPhysicalEventsRequest002 &request) noexcept = 0;
+        // Appended after all existing Interface002 slots.  Call only when
+        // kPlanckFeature002_RemoteCompletionReceipts was advertised.
+        virtual PlanckResult002 DequeueRemoteCompletionReceipt(const PlanckDequeueRemoteCompletionReceiptRequest002 &request, PlanckRemoteCompletionReceipt002 &result) noexcept = 0;
     };
     static_assert(std::is_abstract<IPlanckInterface002>::value);
     static_assert(std::is_same<decltype(&IPlanckInterface002::GetCapabilities),
@@ -236,6 +282,8 @@ namespace PlanckPluginAPI {
         PlanckResult002 (IPlanckInterface002::*)(const PlanckDequeueLocalPhysicalEventRequest002 &, PlanckLocalPhysicalEvent002 &) noexcept>::value);
     static_assert(std::is_same<decltype(&IPlanckInterface002::DiscardLocalPhysicalEvents),
         PlanckResult002 (IPlanckInterface002::*)(const PlanckDiscardLocalPhysicalEventsRequest002 &) noexcept>::value);
+    static_assert(std::is_same<decltype(&IPlanckInterface002::DequeueRemoteCompletionReceipt),
+        PlanckResult002 (IPlanckInterface002::*)(const PlanckDequeueRemoteCompletionReceiptRequest002 &, PlanckRemoteCompletionReceipt002 &) noexcept>::value);
 
     // Header-only client helper so consumers do not need PLANCK implementation objects or headers.
     inline IPlanckInterface002 *GetPlanckInterface002(const PluginHandle &pluginHandle, SKSEMessagingInterface *messagingInterface)

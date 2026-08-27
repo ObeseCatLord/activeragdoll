@@ -321,7 +321,7 @@ void UpdateCollisionFilterOnAllBones(Actor *actor)
 
 std::vector<std::unique_ptr<GenericJob>> g_prePhysicsStepJobs{};
 
-void ProcessRemotePhysics002();
+void ProcessRemotePhysics002() noexcept;
 void ResetRemotePhysics002();
 namespace {
     bool ShouldSuppressLocalPhysicalEvent002(UInt32 targetFormId);
@@ -4181,7 +4181,9 @@ namespace {
         PlanckPluginAPI::PlanckRemoteGripState002 state{};
         double expiresAt;
         double activationDeadline;
+        UInt64 beginEventId{};
         bool hasActivated;
+        bool driveReceiptEmitted{};
     };
 
     struct RemoteReplaySuppression002 {
@@ -4389,7 +4391,12 @@ namespace {
     void RemoveRemoteGripForTarget002(UInt32 targetFormId)
     {
         for (auto it = g_remoteGripControllers002.begin(); it != g_remoteGripControllers002.end();) {
-            if (it->second.targetFormId == targetFormId) it = g_remoteGripControllers002.erase(it);
+            if (it->second.targetFormId == targetFormId) {
+                if (!it->second.driveReceiptEmitted)
+                    g_interface002.CompleteRemoteGripDrive(it->first.sourceSession, it->second.beginEventId,
+                        it->first.gripId, it->second.targetFormId, PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
+                it = g_remoteGripControllers002.erase(it);
+            }
             else ++it;
         }
         g_interface002.ForgetRemoteTarget(targetFormId);
@@ -4415,10 +4422,10 @@ namespace {
         return rigidBody;
     }
 
-    bool ApplyRemoteGripDrive002(RemoteGripController002 &controller, Actor *actor)
+    PlanckPluginAPI::PlanckRemoteCompletionStatus002 ApplyRemoteGripDrive002(RemoteGripController002 &controller, Actor *actor)
     {
         NiPointer<bhkWorld> world = GetHavokWorldFromCell(actor->parentCell);
-        if (!world) return false;
+        if (!world) return PlanckPluginAPI::PlanckRemoteCompletionStatus002::WorldUnavailable;
 
         // This runs from PrePhysicsStepCallback, before Havok advances. The
         // supplied Havok 2010.2 headers mark hkpMotion impulse application as
@@ -4426,15 +4433,16 @@ namespace {
         // Keep the existing object -> world resolution order, but rely on the
         // pre-physics callback's mutation-safe phase just as queued impulses do.
         NiPointer<NiNode> root = actor->GetNiNode();
-        if (!root) return false;
+        if (!root) return PlanckPluginAPI::PlanckRemoteCompletionStatus002::RootUnavailable;
         BSFixedString nodeName(controller.nodeName);
         NiPointer<NiAVObject> node = root->GetObjectByName(&nodeName.data);
-        if (!node) return false;
+        if (!node) return PlanckPluginAPI::PlanckRemoteCompletionStatus002::NodeUnavailable;
         NiPointer<bhkRigidBody> rigidBody = GetRigidBody(node);
         if (!rigidBody) {
             if (NiPointer<NiAVObject> collisionNode = GetClosestParentWithCollision(node, false, false)) rigidBody = GetRigidBody(collisionNode);
         }
-        if (!rigidBody || !FindRigidBody(root, rigidBody) || !rigidBody->hkBody || !rigidBody->hkBody->m_world) return false;
+        if (!rigidBody || !FindRigidBody(root, rigidBody) || !rigidBody->hkBody || !rigidBody->hkBody->m_world)
+            return PlanckPluginAPI::PlanckRemoteCompletionStatus002::RigidBodyUnavailable;
 
         MarkRemoteReplaySuppression002(controller.targetFormId);
         hkpRigidBody *body = rigidBody->hkBody;
@@ -4464,32 +4472,139 @@ namespace {
         }
         const NiPoint3 angularDelta = ClampMagnitude002(rotationalVelocity - HkVectorToNiPoint(body->getAngularVelocity()), kRemoteGripMaxDeltaVelocity002);
         body->m_motion.applyAngularImpulse(NiPointToHkVector(ClampMagnitude002(angularDelta, kRemoteGripMaxAngularImpulse002)));
-        return true;
+        return PlanckPluginAPI::PlanckRemoteCompletionStatus002::GripDriveApplied;
+    }
+
+    class RemoteCommandCompletionGuard002
+    {
+    public:
+        explicit RemoteCommandCompletionGuard002(const PlanckPluginAPI::RemoteCommand002 &command) noexcept
+            : command_(command) {}
+        ~RemoteCommandCompletionGuard002() noexcept { g_interface002.CompleteRemoteCommand(command_, status_); }
+        void SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002 status) noexcept { status_ = status; }
+
+    private:
+        const PlanckPluginAPI::RemoteCommand002 &command_;
+        PlanckPluginAPI::PlanckRemoteCompletionStatus002 status_{PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState};
+    };
+
+    class RemoteCommandBatchGuard002
+    {
+    public:
+        explicit RemoteCommandBatchGuard002(const std::vector<PlanckPluginAPI::RemoteCommand002> &commands) noexcept
+            : commands_(commands) {}
+        ~RemoteCommandBatchGuard002() noexcept
+        {
+            while (completed_ < commands_.size())
+                g_interface002.CompleteRemoteCommand(commands_[completed_++],
+                    PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
+        }
+        void MarkCompleted() noexcept { if (completed_ < commands_.size()) ++completed_; }
+
+    private:
+        const std::vector<PlanckPluginAPI::RemoteCommand002> &commands_;
+        std::size_t completed_{};
+    };
+
+    void EmitRemoteGripDriveOutcome002(const RemoteGripKey002 &key, RemoteGripController002 &controller,
+        PlanckPluginAPI::PlanckRemoteCompletionStatus002 status) noexcept
+    {
+        if (controller.driveReceiptEmitted) return;
+        g_interface002.CompleteRemoteGripDrive(key.sourceSession, controller.beginEventId, key.gripId,
+            controller.targetFormId, status);
+        controller.driveReceiptEmitted = true;
+    }
+
+    class RemoteGripDriveClaimGuard002
+    {
+    public:
+        RemoteGripDriveClaimGuard002(const RemoteGripKey002 &key, RemoteGripController002 &controller) noexcept
+            : key_(key), controller_(controller), emitOutcome_(!controller.driveReceiptEmitted) {}
+        ~RemoteGripDriveClaimGuard002() noexcept
+        {
+            if (emitOutcome_) EmitRemoteGripDriveOutcome002(key_, controller_, status_);
+            else g_interface002.ReleaseRemoteGripDriveClaim(key_.sourceSession, controller_.beginEventId);
+        }
+        void SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002 status) noexcept { status_ = status; }
+
+    private:
+        const RemoteGripKey002 &key_;
+        RemoteGripController002 &controller_;
+        bool emitOutcome_;
+        PlanckPluginAPI::PlanckRemoteCompletionStatus002 status_{PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState};
+    };
+
+    bool ProcessRemoteGripController002(const RemoteGripKey002 &key, RemoteGripController002 &controller)
+    {
+        if (g_interface002.IsRemoteSessionCancelled(key.sourceSession)) {
+            EmitRemoteGripDriveOutcome002(key, controller, PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
+            return false;
+        }
+        NiPointer<TESObjectREFR> refr;
+        Actor *actor = LookupREFRByHandle(controller.refrHandle, refr) ? DYNAMIC_CAST(refr, TESObjectREFR, Actor) : nullptr;
+        if (!actor) {
+            EmitRemoteGripDriveOutcome002(key, controller, PlanckPluginAPI::PlanckRemoteCompletionStatus002::TargetMissing);
+            return false;
+        }
+        if (!actor->GetNiNode()) {
+            EmitRemoteGripDriveOutcome002(key, controller, PlanckPluginAPI::PlanckRemoteCompletionStatus002::RootUnavailable);
+            return false;
+        }
+        if (g_currentFrameTime >= controller.expiresAt) {
+            EmitRemoteGripDriveOutcome002(key, controller, PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
+            return false;
+        }
+        const bool isRagdolled = Actor_IsInRagdollState(actor);
+        if (!isRagdolled) {
+            if (!controller.hasActivated && g_currentFrameTime < controller.activationDeadline) return true;
+            EmitRemoteGripDriveOutcome002(key, controller, PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
+            return false;
+        }
+        controller.hasActivated = true;
+        if (!g_interface002.TryClaimRemoteGripDrive(key.sourceSession, controller.beginEventId)) {
+            EmitRemoteGripDriveOutcome002(key, controller, PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
+            return false;
+        }
+        RemoteGripDriveClaimGuard002 completion(key, controller);
+        const auto status = ApplyRemoteGripDrive002(controller, actor);
+        completion.SetStatus(status);
+        return status == PlanckPluginAPI::PlanckRemoteCompletionStatus002::GripDriveApplied;
     }
 }
 
-void ProcessRemotePhysics002()
+void ProcessRemotePhysics002() noexcept
 {
     const UInt64 cancellationGeneration = g_interface002.GetCancellationGeneration();
     std::vector<PlanckPluginAPI::RemoteCommand002> commands;
-    g_interface002.DrainRemoteCommands(commands);
+    // A command-batch allocation failure leaves undrained commands queued, but
+    // must not suppress bounded controller cleanup/drive work for this step.
+    (void)g_interface002.DrainRemoteCommands(commands);
+    RemoteCommandBatchGuard002 batchCompletion(commands);
+    try {
     for (const auto &command : commands) {
-        // ClearRemoteSession marks cancellation under the producer lock before
-        // draining commands. A copied-but-not-yet-applied mutation must still
-        // lose to that cancellation.
-        if (g_interface002.IsRemoteSessionCancelled(command.SourceSession())) continue;
-        switch (command.type) {
+      try {
+        RemoteCommandCompletionGuard002 completion(command);
+        // Claim and clear are linearized by remoteLock. Clear either installs
+        // its tombstone first, or waits for this claim before returning.
+        if (!g_interface002.TryClaimRemoteCommand(command)) {
+            completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
+        }
+        else switch (command.type) {
         case PlanckPluginAPI::RemoteCommandType002::HitImpulse: {
             const auto &request = command.request.hitImpulse;
             Actor *actor = nullptr;
-            if (!ResolveRemoteActor002(request.targetFormId, actor)) { g_interface002.ForgetRemoteTarget(request.targetFormId); break; }
+            if (!ResolveRemoteActor002(request.targetFormId, actor)) { g_interface002.ForgetRemoteTarget(request.targetFormId); completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::TargetMissing); break; }
             NiPointer<NiNode> root = actor->GetNiNode();
             NiPointer<bhkWorld> world = GetHavokWorldFromCell(actor->parentCell);
-            if (!root || !world) { g_interface002.ForgetRemoteTarget(request.targetFormId); break; }
+            if (!root) { g_interface002.ForgetRemoteTarget(request.targetFormId); completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::RootUnavailable); break; }
+            if (!world) { g_interface002.ForgetRemoteTarget(request.targetFormId); completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::WorldUnavailable); break; }
+            BSFixedString nodeName(request.nodeName);
+            if (!root->GetObjectByName(&nodeName.data)) { completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::NodeUnavailable); break; }
             if (NiPointer<bhkRigidBody> body = ResolveRemoteNodeRigidBody002(root, request.nodeName)) {
                 MarkRemoteReplaySuppression002(request.targetFormId);
                 ApplyHitImpulse(world, actor, body, ToNiPoint002(request.velocity), ToNiPoint002(request.position) * *g_havokWorldScale, request.impulseMultiplier);
-            }
+                completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::Applied);
+            } else completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::RigidBodyUnavailable);
             break;
         }
         case PlanckPluginAPI::RemoteCommandType002::Ragdoll: {
@@ -4498,26 +4613,29 @@ void ProcessRemotePhysics002()
             if (ResolveRemoteActor002(request.targetFormId, actor) && actor->GetNiNode()) {
                 MarkRemoteReplaySuppression002(request.targetFormId);
                 RagdollActorFromPosition(actor, ToNiPoint002(request.sourcePosition), false);
+                completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::Applied);
             }
-            else g_interface002.ForgetRemoteTarget(request.targetFormId);
+            else { g_interface002.ForgetRemoteTarget(request.targetFormId); completion.SetStatus(actor ? PlanckPluginAPI::PlanckRemoteCompletionStatus002::RootUnavailable : PlanckPluginAPI::PlanckRemoteCompletionStatus002::TargetMissing); }
             break;
         }
         case PlanckPluginAPI::RemoteCommandType002::RagdollExit:
             RemoveRemoteGripForTarget002(command.request.ragdollExit.targetFormId);
+            completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::Applied);
             break;
         case PlanckPluginAPI::RemoteCommandType002::BeginGrip: {
             const auto &request = command.request.beginGrip;
             Actor *actor = nullptr;
             const RemoteGripKey002 key{ request.header.sourceSession, request.gripId };
-            if (!ResolveRemoteActor002(request.targetFormId, actor) || !actor->GetNiNode()) { g_interface002.ForgetRemoteTarget(request.targetFormId); break; }
+            if (!ResolveRemoteActor002(request.targetFormId, actor) || !actor->GetNiNode()) { g_interface002.ForgetRemoteTarget(request.targetFormId); completion.SetStatus(actor ? PlanckPluginAPI::PlanckRemoteCompletionStatus002::RootUnavailable : PlanckPluginAPI::PlanckRemoteCompletionStatus002::TargetMissing); break; }
             const auto existing = g_remoteGripControllers002.find(key);
             if (existing != g_remoteGripControllers002.end() && existing->second.targetFormId != request.targetFormId) {
                 // A producer+GripId is bound to one target for its lifetime;
                 // never retarget a duplicate Begin on the game thread.
                 LogRemoteGripRejected002();
+                completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::LeaseInvalid);
                 break;
             }
-            if (existing == g_remoteGripControllers002.end() && g_remoteGripControllers002.size() >= kRemoteGripLimit002) { LogRemoteGripRejected002(); break; }
+            if (existing == g_remoteGripControllers002.end() && g_remoteGripControllers002.size() >= kRemoteGripLimit002) { LogRemoteGripRejected002(); completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState); break; }
             RemoteGripController002 controller{};
             controller.targetFormId = request.targetFormId;
             controller.refrHandle = GetOrCreateRefrHandle(actor);
@@ -4525,55 +4643,83 @@ void ProcessRemotePhysics002()
             controller.state = request.state;
             controller.expiresAt = g_currentFrameTime + request.state.ttlSeconds;
             controller.activationDeadline = g_currentFrameTime + kRemoteGripActivationGraceSeconds002;
+            controller.beginEventId = request.header.eventId;
             controller.hasActivated = Actor_IsInRagdollState(actor);
-            g_remoteGripControllers002[key] = controller;
+            if (existing != g_remoteGripControllers002.end()) {
+                EmitRemoteGripDriveOutcome002(existing->first, existing->second,
+                    PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
+                existing->second = controller;
+            }
+            else {
+                try {
+                    g_remoteGripControllers002.reserve(g_remoteGripControllers002.size() + 1);
+                    const auto inserted = g_remoteGripControllers002.emplace(key, controller).second;
+                    if (!inserted) {
+                        LogRemoteGripRejected002();
+                        completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
+                        break;
+                    }
+                }
+                catch (...) {
+                    LogRemoteGripRejected002();
+                    completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
+                    break;
+                }
+            }
+            completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::GripBeginAdmitted);
             break;
         }
         case PlanckPluginAPI::RemoteCommandType002::UpdateGrip: {
             const auto &request = command.request.updateGrip;
             auto it = g_remoteGripControllers002.find({ request.header.sourceSession, request.gripId });
             if (it != g_remoteGripControllers002.end()) {
-                if (it->second.targetFormId != request.targetFormId) break;
+                if (it->second.targetFormId != request.targetFormId) { completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::LeaseInvalid); break; }
                 it->second.state = request.state;
                 it->second.expiresAt = g_currentFrameTime + request.state.ttlSeconds;
-            }
+                completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::Applied);
+            } else completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
             break;
         }
         case PlanckPluginAPI::RemoteCommandType002::EndGrip: {
             const auto &request = command.request.endGrip;
             const auto existing = g_remoteGripControllers002.find({ request.header.sourceSession, request.gripId });
-            if (existing != g_remoteGripControllers002.end() && existing->second.targetFormId == request.targetFormId)
+            if (existing != g_remoteGripControllers002.end() && existing->second.targetFormId == request.targetFormId) {
+                EmitRemoteGripDriveOutcome002(existing->first, existing->second,
+                    PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
                 g_remoteGripControllers002.erase(existing);
+                completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::Applied);
+            } else completion.SetStatus(PlanckPluginAPI::PlanckRemoteCompletionStatus002::LeaseInvalid);
             break;
         }
         }
+      }
+      catch (...) {
+        // RemoteCommandCompletionGuard002 terminalizes the command and releases
+        // any active claim during unwinding. Keep the remaining batch live.
+      }
+      batchCompletion.MarkCompleted();
+    }
+    }
+    catch (...) {
+        // The batch guard terminalizes any command not reached by the
+        // per-command boundary and releases every remaining reservation.
     }
 
     for (auto it = g_remoteGripControllers002.begin(); it != g_remoteGripControllers002.end();) {
-        RemoteGripController002 &controller = it->second;
-        NiPointer<TESObjectREFR> refr;
-        Actor *actor = LookupREFRByHandle(controller.refrHandle, refr) ? DYNAMIC_CAST(refr, TESObjectREFR, Actor) : nullptr;
-        if (g_interface002.IsRemoteSessionCancelled(it->first.sourceSession) || !actor || !actor->GetNiNode() || g_currentFrameTime >= controller.expiresAt) {
-            const UInt32 targetFormId = controller.targetFormId;
-            it = g_remoteGripControllers002.erase(it);
-            g_interface002.ForgetRemoteTarget(targetFormId);
-            continue;
+        const UInt32 targetFormId = it->second.targetFormId;
+        bool keepController = false;
+        try {
+            keepController = ProcessRemoteGripController002(it->first, it->second);
         }
-        const bool isRagdolled = Actor_IsInRagdollState(actor);
-        if (!isRagdolled) {
-            if (!controller.hasActivated && g_currentFrameTime < controller.activationDeadline) { ++it; continue; }
-            const UInt32 targetFormId = controller.targetFormId;
-            it = g_remoteGripControllers002.erase(it);
-            g_interface002.ForgetRemoteTarget(targetFormId);
-            continue;
+        catch (...) {
+            EmitRemoteGripDriveOutcome002(it->first, it->second,
+                PlanckPluginAPI::PlanckRemoteCompletionStatus002::InvalidState);
         }
-        controller.hasActivated = true;
-        if (!ApplyRemoteGripDrive002(controller, actor)) {
-            const UInt32 targetFormId = controller.targetFormId;
+        if (keepController) ++it;
+        else {
             it = g_remoteGripControllers002.erase(it);
             g_interface002.ForgetRemoteTarget(targetFormId);
         }
-        else ++it;
     }
     g_interface002.CompleteCancellationSweep(cancellationGeneration);
 }
@@ -4581,15 +4727,23 @@ void ProcessRemotePhysics002()
 void ResetRemotePhysics002()
 {
     // Ends use only retained scalar IDs, so world teardown never dereferences a
-    // stale actor or rigid-body pointer. ResetRemoteState intentionally keeps
-    // these terminal local events available to the bridge.
+    // stale actor or rigid-body pointer. The reset barrier terminalizes queued
+    // commands and prevents any later claim before controller state is cleared.
     ResetLocalActorPhysicalEvents002();
+    if (g_interface002.BeginRemoteReset() == PlanckPluginAPI::RemoteResetQuiescence002::RetryRequired)
+        g_interface002.RequireRemoteResetQuiescence();
+    for (auto &entry : g_remoteGripControllers002) {
+        EmitRemoteGripDriveOutcome002(entry.first, entry.second,
+            PlanckPluginAPI::PlanckRemoteCompletionStatus002::Cancelled);
+    }
     g_remoteGripControllers002.clear();
     {
         std::scoped_lock lock(g_remoteReplaySuppressionsLock002);
         g_remoteReplaySuppressions002.clear();
     }
-    g_interface002.ResetRemoteState();
+    // Finish only after every admitted controller has converted its reserved
+    // first-drive receipt into a retained terminal cancellation receipt.
+    g_interface002.FinishRemoteReset();
 }
 
 

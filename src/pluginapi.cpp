@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
+#include <thread>
 
 #include "config.h"
 #include "pluginapi.h"
@@ -37,6 +39,19 @@ namespace {
     PlanckResult002 Result002(PlanckResultCode002 code, std::uint64_t sequence = 0)
     {
         return { sizeof(PlanckResult002), code, sequence };
+    }
+
+    PlanckRemoteCompletionKind002 CompletionKind002(const RemoteCommandType002 type) noexcept
+    {
+        switch (type) {
+        case RemoteCommandType002::HitImpulse: return PlanckRemoteCompletionKind002::HitImpulse;
+        case RemoteCommandType002::Ragdoll: return PlanckRemoteCompletionKind002::Ragdoll;
+        case RemoteCommandType002::RagdollExit: return PlanckRemoteCompletionKind002::RagdollExit;
+        case RemoteCommandType002::BeginGrip: return PlanckRemoteCompletionKind002::GripBegin;
+        case RemoteCommandType002::UpdateGrip: return PlanckRemoteCompletionKind002::GripUpdate;
+        case RemoteCommandType002::EndGrip: return PlanckRemoteCompletionKind002::GripEnd;
+        }
+        return PlanckRemoteCompletionKind002::HitImpulse;
     }
 
     bool IsFinite002(float value, float limit)
@@ -235,7 +250,7 @@ PlanckResult002 PlanckInterface002::GetCapabilities(const PlanckCapabilitiesRequ
     result = { sizeof(result), kPlanckInterface002Revision,
         kPlanckFeature002_RemoteHitImpulse | kPlanckFeature002_RemoteRagdoll |
         kPlanckFeature002_RemoteGripImpulseDrive | kPlanckFeature002_LocalPhysicalEvents |
-        kPlanckFeature002_LocalEventRebase,
+        kPlanckFeature002_LocalEventRebase | kPlanckFeature002_RemoteCompletionReceipts,
         static_cast<UInt32>(kRemoteCommandLimit002), static_cast<UInt32>(kLocalEventLimit002) };
     return Result002(PlanckResultCode002::Accepted);
 }
@@ -280,7 +295,7 @@ PlanckResult002 PlanckInterface002::Enqueue(RemoteCommand002 command, const Plan
     // A clear is an irreversible lifecycle boundary for a source-session
     // token. Do not allow a racing network producer to requeue stale work
     // after it has been cancelled.
-    if (remoteAdmissionDisabled || cancelledRemoteSessions.contains(header.sourceSession))
+    if (resetInProgress || remoteAdmissionDisabled || cancelledRemoteSessions.contains(header.sourceSession))
         return Result002(PlanckResultCode002::Duplicate);
     while (!seenEvents.empty() && seenEvents.front().expiresAt <= now) seenEvents.pop_front();
     if (std::any_of(seenEvents.begin(), seenEvents.end(), [&header](const SeenEvent &seen) {
@@ -335,7 +350,11 @@ PlanckResult002 PlanckInterface002::Enqueue(RemoteCommand002 command, const Plan
         if (existing == gripAdmissions.end() || existing->second != targetFormId)
             return rejectLocked();
     }
-    if (remoteCommands.size() >= kRemoteCommandLimit002 || seenEvents.size() >= kSeenEventLimit002) {
+    const bool reservesGripDriveReceipt = command.type == RemoteCommandType002::BeginGrip;
+    const std::size_t receiptReservations = 1 + (reservesGripDriveReceipt ? 1 : 0);
+    if (remoteCommands.size() >= kRemoteCommandLimit002 || seenEvents.size() >= kSeenEventLimit002 ||
+        remoteCompletionReceiptCount + reservedRemoteCompletionReceipts + receiptReservations >
+            kRemoteCompletionReceiptLimit002) {
         ++overflowRequests;
         if ((overflowRequests & (overflowRequests - 1)) == 0) _MESSAGE("PLANCK interface 002 queue overflow (%u rejections)", overflowRequests);
         return Result002(PlanckResultCode002::QueueFull);
@@ -352,12 +371,16 @@ PlanckResult002 PlanckInterface002::Enqueue(RemoteCommand002 command, const Plan
     }
 
     const std::uint64_t sequence = nextSequence++;
+    command.sequence = sequence;
+    command.hasGripDriveReceiptReservation = reservesGripDriveReceipt;
     const auto priorSeenCount = seenEvents.size();
     const auto priorCommandCount = remoteCommands.size();
     try {
         seenEvents.push_back({ header.sourceSession, header.eventId, targetFormId, now + kSeenEventLifetimeMs002 });
         remoteCommands.push_back(command);
         if (addGripAdmission) gripAdmissions.emplace(gripKey, targetFormId);
+        reservedRemoteCompletionReceipts += receiptReservations;
+        if (reservesGripDriveReceipt) ++reservedGripDriveReceipts;
     }
     catch (...) {
         // The pre-reserves above make these pushes non-throwing in practice;
@@ -425,7 +448,7 @@ PlanckResult002 PlanckInterface002::EndRemoteGrip(const PlanckEndRemoteGripReque
 PlanckResult002 PlanckInterface002::ClearRemoteSession(const PlanckClearRemoteSessionRequest002 &request) noexcept
 {
     if (!IsValidHeader002(request.header, sizeof(request))) return InvalidRequest();
-    std::scoped_lock lock(remoteLock);
+    std::unique_lock<std::mutex> lock(remoteLock);
     const std::uint64_t now = NowMs002();
     PruneCancelledRemoteSessions(now);
 
@@ -460,6 +483,10 @@ PlanckResult002 PlanckInterface002::ClearRemoteSession(const PlanckClearRemoteSe
             }
         }
     }
+    for (const auto &command : remoteCommands) {
+        if (command.SourceSession() == request.header.sourceSession)
+            CompleteQueuedRemoteCommandLocked(command, PlanckRemoteCompletionStatus002::Cancelled);
+    }
     remoteCommands.erase(std::remove_if(remoteCommands.begin(), remoteCommands.end(),
         [&request](const RemoteCommand002 &command) {
             return command.SourceSession() == request.header.sourceSession;
@@ -469,6 +496,19 @@ PlanckResult002 PlanckInterface002::ClearRemoteSession(const PlanckClearRemoteSe
             return seen.session == request.header.sourceSession;
         }), seenEvents.end());
     ForgetGripAdmissionsForSession(request.header.sourceSession);
+    // The tombstone was committed before this wait. A command or persistent
+    // drive that already owns the claim may finish; every later claim sees the
+    // tombstone and is denied. condition_variable::wait releases remoteLock,
+    // so no game/Havok call executes while the producer mutex is held.
+    try {
+        remoteClaimChanged.wait(lock, [this, &request]() noexcept {
+            return claimedApplyKind == ApplyClaimKind::None ||
+                   claimedSourceSession != request.header.sourceSession;
+        });
+    }
+    catch (...) {
+        return Result002(PlanckResultCode002::AllocationFailure, nextSequence);
+    }
     const std::uint64_t sequence = nextSequence++;
     if (nextSequence == 0) ++nextSequence;
     return Result002(PlanckResultCode002::Accepted, sequence);
@@ -493,14 +533,170 @@ PlanckResult002 PlanckInterface002::DiscardLocalPhysicalEvents(const PlanckDisca
     return Result002(PlanckResultCode002::Accepted, request.lifecycleGeneration);
 }
 
-void PlanckInterface002::DrainRemoteCommands(std::vector<RemoteCommand002> &out) noexcept
+PlanckResult002 PlanckInterface002::DequeueRemoteCompletionReceipt(
+    const PlanckDequeueRemoteCompletionReceiptRequest002 &request,
+    PlanckRemoteCompletionReceipt002 &result) noexcept
+{
+    if (request.size < sizeof(request) || request.reserved != 0 || result.size < sizeof(result))
+        return InvalidRequest();
+    std::scoped_lock lock(remoteLock);
+    if (remoteCompletionReceiptCount == 0)
+        return Result002(PlanckResultCode002::Empty);
+    result = remoteCompletionReceipts[remoteCompletionReceiptHead];
+    remoteCompletionReceiptHead = (remoteCompletionReceiptHead + 1) % kRemoteCompletionReceiptLimit002;
+    --remoteCompletionReceiptCount;
+    return Result002(PlanckResultCode002::Accepted, result.sequence);
+}
+
+bool PlanckInterface002::AppendRemoteCompletionReceiptLocked(const PlanckRemoteCompletionReceipt002 &receipt) noexcept
+{
+    if (remoteCompletionReceiptCount >= kRemoteCompletionReceiptLimit002) {
+        ++completionReceiptOverflows;
+        if ((completionReceiptOverflows & (completionReceiptOverflows - 1)) == 0)
+            _MESSAGE("PLANCK interface 002 remote completion receipt reservation invariant failed (%u blocked)", completionReceiptOverflows);
+        return false;
+    }
+    remoteCompletionReceipts[(remoteCompletionReceiptHead + remoteCompletionReceiptCount) %
+        kRemoteCompletionReceiptLimit002] = receipt;
+    ++remoteCompletionReceiptCount;
+    return true;
+}
+
+void PlanckInterface002::ReleaseGripDriveReceiptReservationLocked() noexcept
+{
+    if (reservedGripDriveReceipts != 0)
+        --reservedGripDriveReceipts;
+    else
+        ++completionReceiptOverflows;
+}
+
+void PlanckInterface002::CompleteQueuedRemoteCommandLocked(
+    const RemoteCommand002 &command, const PlanckRemoteCompletionStatus002 status) noexcept
+{
+    if (!AppendRemoteCompletionReceiptLocked({sizeof(PlanckRemoteCompletionReceipt002), CompletionKind002(command.type), status, 0,
+            command.SourceSession(), command.EventId(), command.sequence, command.GripId(), command.TargetFormId(), 0}))
+        return;
+    if (reservedRemoteCompletionReceipts != 0)
+        --reservedRemoteCompletionReceipts;
+    else
+        ++completionReceiptOverflows;
+    // A Begin that never became a controller has no first-drive outcome. Its
+    // second reservation is released only after its command receipt is kept.
+    if (ReleasesGripDriveReceiptReservation002(command.hasGripDriveReceiptReservation, status)) {
+        ReleaseGripDriveReceiptReservationLocked();
+        if (reservedRemoteCompletionReceipts != 0)
+            --reservedRemoteCompletionReceipts;
+        else
+            ++completionReceiptOverflows;
+    }
+}
+
+bool PlanckInterface002::TryClaimRemoteApplyLocked(
+    const UInt64 sourceSession, const UInt64 operationId, const ApplyClaimKind kind) noexcept
+{
+    if (sourceSession == 0 || operationId == 0 || kind == ApplyClaimKind::None ||
+        !CanClaimRemoteApply002(resetInProgress, remoteAdmissionDisabled,
+            cancelledRemoteSessions.contains(sourceSession), claimedApplyKind != ApplyClaimKind::None))
+        return false;
+    claimedSourceSession = sourceSession;
+    claimedOperationId = operationId;
+    claimedApplyKind = kind;
+    return true;
+}
+
+bool PlanckInterface002::ReleaseRemoteApplyClaimLocked(
+    const UInt64 sourceSession, const UInt64 operationId, const ApplyClaimKind kind) noexcept
+{
+    if (claimedApplyKind != kind || claimedSourceSession != sourceSession || claimedOperationId != operationId)
+        return false;
+    claimedSourceSession = 0;
+    claimedOperationId = 0;
+    claimedApplyKind = ApplyClaimKind::None;
+    return true;
+}
+
+bool PlanckInterface002::TryClaimRemoteCommand(const RemoteCommand002 &command) noexcept
 {
     std::scoped_lock lock(remoteLock);
-    out.reserve(out.size() + remoteCommands.size());
-    while (!remoteCommands.empty()) {
-        out.push_back(remoteCommands.front());
-        remoteCommands.pop_front();
+    PruneCancelledRemoteSessions(NowMs002());
+    return TryClaimRemoteApplyLocked(command.SourceSession(), command.sequence, ApplyClaimKind::Command);
+}
+
+bool PlanckInterface002::TryClaimRemoteGripDrive(const UInt64 sourceSession, const UInt64 beginEventId) noexcept
+{
+    std::scoped_lock lock(remoteLock);
+    PruneCancelledRemoteSessions(NowMs002());
+    return TryClaimRemoteApplyLocked(sourceSession, beginEventId, ApplyClaimKind::GripDrive);
+}
+
+void PlanckInterface002::CompleteRemoteCommand(
+    const RemoteCommand002 &command, const PlanckRemoteCompletionStatus002 status) noexcept
+{
+    std::unique_lock<std::mutex> lock(remoteLock);
+    if (inFlightRemoteCommands != 0)
+        --inFlightRemoteCommands;
+    const bool released = ReleaseRemoteApplyClaimLocked(command.SourceSession(), command.sequence, ApplyClaimKind::Command);
+    CompleteQueuedRemoteCommandLocked(command, status);
+    const bool notifyWaiters = released || resetInProgress || inFlightRemoteCommands == 0;
+    lock.unlock();
+    if (notifyWaiters)
+        remoteClaimChanged.notify_all();
+}
+
+void PlanckInterface002::ReleaseRemoteGripDriveClaim(const UInt64 sourceSession, const UInt64 beginEventId) noexcept
+{
+    std::unique_lock<std::mutex> lock(remoteLock);
+    const bool released = ReleaseRemoteApplyClaimLocked(sourceSession, beginEventId, ApplyClaimKind::GripDrive);
+    lock.unlock();
+    if (released)
+        remoteClaimChanged.notify_all();
+}
+
+void PlanckInterface002::CompleteRemoteGripDrive(
+    const UInt64 sourceSession, const UInt64 eventId, const UInt64 gripId, const UInt32 targetFormId,
+    const PlanckRemoteCompletionStatus002 status) noexcept
+{
+    if (sourceSession == 0 || eventId == 0 || gripId == 0 || targetFormId == 0)
+        return;
+    std::unique_lock<std::mutex> lock(remoteLock);
+    const bool released = ReleaseRemoteApplyClaimLocked(sourceSession, eventId, ApplyClaimKind::GripDrive);
+    if (AppendRemoteCompletionReceiptLocked({sizeof(PlanckRemoteCompletionReceipt002), PlanckRemoteCompletionKind002::GripDrive,
+            status, 0, sourceSession, eventId, 0, gripId, targetFormId, 0})) {
+        ReleaseGripDriveReceiptReservationLocked();
+        if (reservedRemoteCompletionReceipts != 0)
+            --reservedRemoteCompletionReceipts;
+        else
+            ++completionReceiptOverflows;
     }
+    lock.unlock();
+    if (released)
+        remoteClaimChanged.notify_all();
+}
+
+bool PlanckInterface002::DrainRemoteCommands(std::vector<RemoteCommand002> &out) noexcept
+{
+    std::scoped_lock lock(remoteLock);
+    if (resetInProgress)
+        return false;
+    try {
+        out.reserve(out.size() + remoteCommands.size());
+    }
+    catch (...) {
+        ++completionReceiptOverflows;
+        return false;
+    }
+    while (!remoteCommands.empty()) {
+        try {
+            out.push_back(remoteCommands.front());
+        }
+        catch (...) {
+            ++completionReceiptOverflows;
+            return !out.empty();
+        }
+        remoteCommands.pop_front();
+        ++inFlightRemoteCommands;
+    }
+    return true;
 }
 
 void PlanckInterface002::EnqueueLocalPhysicalEvent(const PlanckLocalPhysicalEvent002 &event) noexcept
@@ -559,17 +755,81 @@ void PlanckInterface002::EnqueueLocalPhysicalEvent(const PlanckLocalPhysicalEven
     localEvents.push_back(copy);
 }
 
-void PlanckInterface002::ResetRemoteState() noexcept
+RemoteResetQuiescence002 PlanckInterface002::WaitForRemoteResetQuiescenceLocked(
+    std::unique_lock<std::mutex> &lock) noexcept
 {
-    std::scoped_lock lock(remoteLock);
+    const auto isQuiesced = [this]() noexcept {
+        return claimedApplyKind == ApplyClaimKind::None && inFlightRemoteCommands == 0;
+    };
+    if (isQuiesced())
+        return RemoteResetQuiescence002::Quiesced;
+    try {
+        remoteClaimChanged.wait(lock, isQuiesced);
+        return RemoteResetQuiescence002::Quiesced;
+    }
+    catch (...) {
+        // Keep both barriers installed. The caller must retry the same
+        // predicate or fail-stop before touching retained controller state.
+        remoteAdmissionDisabled = true;
+        _MESSAGE("PLANCK interface 002 remote reset quiescence wait failed; barrier retained");
+        return isQuiesced() ? RemoteResetQuiescence002::Quiesced :
+            RemoteResetQuiescence002::RetryRequired;
+    }
+}
+
+RemoteResetQuiescence002 PlanckInterface002::BeginRemoteReset() noexcept
+{
+    std::unique_lock<std::mutex> lock(remoteLock);
+    resetInProgress = true;
+    for (const auto &command : remoteCommands)
+        CompleteQueuedRemoteCommandLocked(command, PlanckRemoteCompletionStatus002::Cancelled);
     remoteCommands.clear();
+    return WaitForRemoteResetQuiescenceLocked(lock);
+}
+
+void PlanckInterface002::RequireRemoteResetQuiescence() noexcept
+{
+    // The condition variable has already thrown, so recovery must not depend
+    // on it. Poll under the same mutex, sleeping only after releasing it so an
+    // active game/physics claim can complete and publish its receipt.
+    constexpr std::size_t kExceptionalWaitPollLimit002 = 5000;
+    constexpr auto kExceptionalWaitPollInterval002 = std::chrono::milliseconds(1);
+    for (std::size_t attempt = 0; attempt < kExceptionalWaitPollLimit002; ++attempt) {
+        {
+            std::scoped_lock lock(remoteLock);
+            if (!resetInProgress) {
+                _MESSAGE("PLANCK interface 002 remote reset barrier disappeared during wait recovery");
+                std::terminate();
+            }
+            if (claimedApplyKind == ApplyClaimKind::None && inFlightRemoteCommands == 0)
+                return;
+        }
+        std::this_thread::sleep_for(kExceptionalWaitPollInterval002);
+    }
+    _MESSAGE("PLANCK interface 002 cannot prove remote reset quiescence; terminating");
+    std::terminate();
+}
+
+void PlanckInterface002::FinishRemoteReset() noexcept
+{
+    std::unique_lock<std::mutex> lock(remoteLock);
+    // Receipt storage is intentionally preserved: reset terminalizations are
+    // diagnostic data even though the bridge may reset its lifecycle ledger.
     seenEvents.clear();
     gripAdmissions.clear();
     cancelledRemoteSessions.clear();
     cancelledRemoteSessionOrder.clear();
     cancellationGeneration = 0;
     completedCancellationGeneration = 0;
-    remoteAdmissionDisabled = false;
+    if (reservedRemoteCompletionReceipts == 0 && reservedGripDriveReceipts == 0)
+        remoteAdmissionDisabled = false;
+    else {
+        DisableRemoteAdmission();
+        _MESSAGE("PLANCK interface 002 reset retained %zu unresolved completion reservations", reservedRemoteCompletionReceipts);
+    }
+    resetInProgress = false;
+    lock.unlock();
+    remoteClaimChanged.notify_all();
 }
 
 void PlanckInterface002::ForgetRemoteTarget(UInt32 targetFormId) noexcept
@@ -585,7 +845,7 @@ bool PlanckInterface002::IsRemoteSessionCancelled(UInt64 sourceSession) noexcept
 {
     std::scoped_lock lock(remoteLock);
     PruneCancelledRemoteSessions(NowMs002());
-    return sourceSession != 0 && (remoteAdmissionDisabled || cancelledRemoteSessions.contains(sourceSession));
+    return sourceSession != 0 && (resetInProgress || remoteAdmissionDisabled || cancelledRemoteSessions.contains(sourceSession));
 }
 
 UInt64 PlanckInterface002::GetCancellationGeneration() noexcept
